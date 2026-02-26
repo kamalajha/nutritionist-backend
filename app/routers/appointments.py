@@ -19,6 +19,7 @@ from app.crud.appointment import (
     cancel_appointment
 )
 from app.schemas.appointment import Appointment, AppointmentCreate, AppointmentUpdate, AppointmentWithDetails, PaymentOrderCreate
+from app.schemas import appointment
 load_dotenv()
 router = APIRouter(prefix="/appointments", tags=["appointments"])
 CASHFREE_APP_ID = os.getenv("CASHFREE_APP_ID")
@@ -164,7 +165,7 @@ async def create_payment_order(
         from datetime import datetime, time as dt_time
         
         appt_date = datetime.strptime(req.appointment_date, "%Y-%m-%d").date()
-        appt_time = datetime.strptime(req.appointment_time, "%H:%M:%S").time()
+        appt_time = datetime.strptime(req.appointment_time, "%H:%M").time()
         
         # End time calculate karo (1 hour later)
         from datetime import timedelta
@@ -306,6 +307,7 @@ async def verify_payment(order_id: str, db: Session = Depends(get_db)):
         return {"status": "error", "details": str(e)}
 @router.delete("/{appointment_id}")
 def delete_appointment(
+    
     appointment_id: uuid.UUID,
     current_user = Depends(get_current_active_user),
     db: Session = Depends(get_db)
@@ -342,56 +344,46 @@ def delete_appointment(
     return {"message": "Appointment cancelled successfully"}
     
     # app/routers/appointments.py
+
 # 1. Jab koi meeting join kare (Start)
 @router.post("/{appointment_id}/start-session")
-async def start_session(appointment_id: str, db: Session = Depends(get_db)):
+async def start_session(appointment_id: uuid.UUID, db: Session = Depends(get_db)):
+
     appointment = db.query(AppointmentModel).filter(
         AppointmentModel.appointment_id == appointment_id
     ).first()
-    
-    if not appointment:
-        raise HTTPException(status_code=404, detail="Appointment not found")
-    
-    # 1. Session start time update karein
+
     appointment.actual_start_time = datetime.utcnow()
-    appointment.status = "confirmed" # Status update zaroori hai
-    
-    # 2. Virtual Meeting URL generate karein (Pattern match for frontend pop-up)
-    # Aap Jitsi ya Google Meet ka static pattern use kar sakte hain
-    meeting_link = f"https://meet.jit.si/nutrition-{appointment_id}"
-    
-    # 3. Patient ke liye Notification insert karein
-    new_notif = Notification(
-        user_id=appointment.user_id, # Patient ki ID
-        message=f"Doctor is waiting! Click to join your virtual session: {meeting_link}",
-        status="unread",
-        created_at=datetime.utcnow()
-    )
-    
-    db.add(new_notif)
+    appointment.status = "confirmed"
+
     db.commit()
-    
+
     return {
-        "message": "Session started and patient notified", 
-        "meeting_link": meeting_link
+        "message": "Session started",
+        "meeting_url": appointment.meeting_url  # database se meeting URL bhejo
     }
 
-# 2. Jab meeting khatam ho (End)
 @router.post("/{appointment_id}/end-session")
-async def end_session(appointment_id: uuid.UUID, db: Session = Depends(get_db)):
+async def end_session(
+    appointment_id: uuid.UUID,
+    db: Session = Depends(get_db)
+):
     appointment = db.query(AppointmentModel).filter(
         AppointmentModel.appointment_id == appointment_id
     ).first()
-    
+
     if not appointment:
         raise HTTPException(status_code=404, detail="Appointment not found")
 
+    appointment.actual_end_time = datetime.utcnow()   # 👈 YAHAN SE AATA HAI
+    appointment.status = "completed"
 
-    appointment.end_time = datetime.utcnow().time() # Sirf Time save karega
-    appointment.status = "completed" 
-    
     db.commit()
-    return {"message": "Session ended successfully", "actual_end_time": appointment.end_time}
+
+    return {
+        "message": "Session ended successfully",
+        "actual_end_time": appointment.actual_end_time
+    }
 
 @router.get("/nutritionists/{id}/slots")
 def get_auto_slots(id: int, date: str, db: Session = Depends(get_db)):
