@@ -15,7 +15,7 @@ class Appointment(Base):
     nutritionist_id = Column(Integer, ForeignKey("nutritionists.nutritionist_id", ondelete="CASCADE"), nullable=False)
     appointment_date = Column(Date, nullable=False)
     start_time = Column(Time, nullable=False)
-    end_time = Column(Time, nullable=False)
+    end_time = Column(Time, nullable=True)
     appointment_type = Column(String(20))  # virtual, in_person, phone_call
     status = Column(String(20), default="scheduled")  # scheduled, confirmed, in_progress, completed, cancelled, no_show
     meeting_url = Column(Text)

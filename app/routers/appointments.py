@@ -14,6 +14,7 @@ from app.models.notification import Notification
 from pydantic import BaseModel, EmailStr
 from app.database import get_db
 from app.dependencies import get_current_active_user
+from app.services.zoom_service import create_zoom_meeting
 from app.crud.appointment import (
     get_appointments, get_appointment, create_appointment, update_appointment,
     cancel_appointment
@@ -128,7 +129,7 @@ def cancel_existing_appointment(
     db: Session = Depends(get_db)
 ):
     return cancel_appointment(db, appointment_id, current_user.user_id, reason)
-# app/routers/appointments.py
+
 
 class PaymentRequest(BaseModel):
     appointment_id: Optional[uuid.UUID] = None
@@ -138,8 +139,6 @@ class PaymentRequest(BaseModel):
     appointment_type: Optional[str] = "virtual"
     notes: Optional[str] = None
 
-# app/routers/appointments.py
-
 @router.post("/create-payment-order")
 async def create_payment_order(
     req: PaymentRequest,
@@ -148,59 +147,46 @@ async def create_payment_order(
 ):
     try:
         generated_order_id = f"order_{uuid.uuid4().hex[:12]}"
-        fee = 0
         
-        # Nutritionist ki fee fetch karo
-        if req.nutritionist_id:
-            n = db.query(NutritionistModel).filter(
-                NutritionistModel.nutritionist_id == req.nutritionist_id
-            ).first()
-            if not n:
-                raise HTTPException(status_code=404, detail="Nutritionist not found")
-            fee = n.hourly_rate
-        else:
-            raise HTTPException(status_code=400, detail="Nutritionist ID required")
+        # 1. Nutritionist ki fee fetch karo
+        nutritionist = db.query(NutritionistModel).filter(
+            NutritionistModel.nutritionist_id == req.nutritionist_id
+        ).first()
+        
+        if not nutritionist:
+            raise HTTPException(status_code=404, detail="Nutritionist not found")
+        
+        fee = nutritionist.hourly_rate
 
-        # Parse date and time properly
-        from datetime import datetime, time as dt_time
-        
+        # 2. Parse date and time (Simple parsing)
         appt_date = datetime.strptime(req.appointment_date, "%Y-%m-%d").date()
-        appt_time = datetime.strptime(req.appointment_time, "%H:%M").time()
         
-        # End time calculate karo (1 hour later)
-        from datetime import timedelta
-        start_datetime = datetime.combine(appt_date, appt_time)
-        end_datetime = start_datetime + timedelta(hours=1)
-        end_time = end_datetime.time()
+        # Backend safety check for HH:MM:SS format
+        time_val = req.appointment_time
+        if len(time_val.split(':')) == 2:
+            time_val += ":00"
+        appt_time = datetime.strptime(time_val, "%H:%M:%S").time()
 
-        # New appointment create karo with pending status
+        # 3. New appointment create karo (Pending status)
         new_appt = AppointmentModel(
             appointment_id=uuid.uuid4(),
             user_id=current_user.user_id,
             nutritionist_id=req.nutritionist_id,
             appointment_date=appt_date,
-            start_time=appt_time,      # Booking start time
-            end_time=end_time,          # Booking end time (1hr later)
+            start_time=appt_time,
             appointment_type=req.appointment_type or "virtual",
+            end_time=None,
             notes=req.notes,
             status="scheduled",
             payment_status="PENDING",
             cashfree_order_id=generated_order_id,
-            amount=int(fee * 100),
-            
-            actual_start_time=None, 
-            actual_end_time=None
+            amount=int(fee) # Payment gateway ke liye amount
         )
         db.add(new_appt)
         db.commit()
         db.refresh(new_appt)
 
-        # Phone formatting
-        phone = getattr(current_user, "contact_number", "9123456789")
-        clean_phone = "".join(filter(str.isdigit, str(phone)))
-        final_phone = clean_phone[2:] if len(clean_phone) == 12 and clean_phone.startswith("91") else clean_phone[-10:]
-
-        # Cashfree payload
+        # 4. Cashfree payload (Simplified)
         order_payload = {
             "order_id": generated_order_id,
             "order_amount": float(fee),
@@ -208,7 +194,7 @@ async def create_payment_order(
             "customer_details": {
                 "customer_id": f"CUST_{current_user.user_id}",
                 "customer_email": current_user.email,
-                "customer_phone": final_phone
+                "customer_phone": getattr(current_user, "contact_number", "9999999999")[-10:]
             }
         }
 
@@ -219,7 +205,7 @@ async def create_payment_order(
             "Content-Type": "application/json"
         }
 
-        # Cashfree API call
+        # 5. Cashfree API call
         response = requests.post(CASHFREE_URL, json=order_payload, headers=headers)
         response_data = response.json()
 
@@ -227,27 +213,18 @@ async def create_payment_order(
             return {
                 "payment_session_id": response_data.get("payment_session_id"),
                 "order_id": generated_order_id,
-                "appointment_id": str(new_appt.appointment_id)  # Frontend ko appointment ID bhi bhejo
+                "appointment_id": str(new_appt.appointment_id)
             }
         else:
-            # Agar Cashfree fail ho gaya, appointment delete karo
             db.delete(new_appt)
             db.commit()
             raise HTTPException(status_code=400, detail=response_data.get("message"))
 
     except Exception as e:
         db.rollback()
-     
-        error_details = traceback.format_exc() 
-        print("---------- CRASH LOG START ----------")
-        print(error_details)
-        print("---------- CRASH LOG END ------------")
-        
-        # Frontend ko bhi detail bhej dein (Sirf debugging ke liye)
-        raise HTTPException(
-            status_code=500, 
-            detail=f"Backend Error: {str(e)} | Details: {error_details[:100]}..."
-        )
+        print(f"Payment Order Error: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 from sqlalchemy import cast, String
 import requests
@@ -257,7 +234,7 @@ import requests
 @router.get("/verify-payment/{order_id}")
 async def verify_payment(order_id: str, db: Session = Depends(get_db)):
     try:
-        # Cashfree se status check karo
+        # 1. Cashfree se status check karo
         url = f"{CASHFREE_URL}/{order_id}"
         headers = {
             "x-client-id": CASHFREE_APP_ID,
@@ -269,7 +246,7 @@ async def verify_payment(order_id: str, db: Session = Depends(get_db)):
         data = response.json()
         order_status = data.get("order_status")
 
-        # Database mein appointment find karo
+        # 2. Database mein appointment aur user details find karo
         appointment = db.query(AppointmentModel).filter(
             AppointmentModel.cashfree_order_id == order_id
         ).first()
@@ -277,30 +254,48 @@ async def verify_payment(order_id: str, db: Session = Depends(get_db)):
         if not appointment:
             return {"status": "failed", "details": "Appointment not found in database"}
 
-        # Status ke according update karo
+        # 3. Status ke according update karo
+       # ... (Aapka pichle code ka logic yahan tak sahi hai) ...
         if order_status == "PAID":
-            #  Meeting URL generation
-            import uuid
-            meeting_id = str(uuid.uuid4())[:8]
-            meeting_url = f"https://meet.jit.si/nutrition-{meeting_id}"
+            if appointment.status == "confirmed":
+                return {"status": "success", "appointment_id": str(appointment.appointment_id)}
+
+            zoom_time = f"{appointment.appointment_date}T{appointment.start_time.strftime('%H:%M:%S')}"
             
+            try:
+                from app.models.user import User as UserModel
+                patient = db.query(UserModel).filter(UserModel.user_id == appointment.user_id).first()
+                patient_name = patient.full_name if patient else "Patient"
+
+                print(f"DEBUG: Processing order {order_id}")
+                zoom_meeting = create_zoom_meeting(
+                    topic=f"Nutrition Session with {patient_name}",
+                    start_time_str=zoom_time
+                )
+                print(f"DEBUG: Zoom Response -> {zoom_meeting}")
+                
+                # Check karein ki Zoom ne link diya ya nahi
+                meeting_url = zoom_meeting.get("join_url") if zoom_meeting else None
+                
+            except Exception as e:
+                print(f"Zoom Logic Crash: {e}")
+                meeting_url = None
+
+            #  IMPORTANT: Agar Zoom fail hua toh backup link do
+            if not meeting_url:
+                meeting_url = f"https://meet.jit.si/nutrition-backup-{uuid.uuid4().hex[:8]}"
+            
+            #  DATABASE UPDATE (Ye part aapka missing tha)
             appointment.status = "confirmed"
             appointment.payment_status = "SUCCESS"
+            appointment.meeting_url = meeting_url
             appointment.transaction_id = data.get("cf_order_id")
-            appointment.meeting_url = meeting_url  #Meeting URL add karo
-            db.commit()
-            print(f"Success: Order {order_id} verified and confirmed")
-            return {"status": "success", "appointment_id": str(appointment.appointment_id)}
-        
-        elif order_status in ["ACTIVE", "PENDING"]:
-            return {"status": "pending", "details": "Payment is still in progress"}
-        
-        else:  # FAILED, EXPIRED, etc
-            appointment.status = "cancelled"
-            appointment.payment_status = "FAILED"
-            db.commit()
-            return {"status": "failed", "details": order_status}
-
+            
+            db.commit() # Database mein save karo!
+            db.refresh(appointment)
+            
+            print(f"DEBUG: Appointment {appointment.appointment_id} confirmed with link: {meeting_url}")
+            return {"status": "success", "appointment_id": str(appointment.appointment_id), "meeting_url": meeting_url}
     except Exception as e:
         db.rollback()
         print(f"Verification Error: {str(e)}")
@@ -379,41 +374,50 @@ async def end_session(
     appointment.status = "completed"
 
     db.commit()
-
+    db.refresh(appointment)
     return {
         "message": "Session ended successfully",
         "actual_end_time": appointment.actual_end_time
     }
 
+
 @router.get("/nutritionists/{id}/slots")
 def get_auto_slots(id: int, date: str, db: Session = Depends(get_db)):
-    # 1. Fixed timing (10 AM to 5 PM)
-    start_time = datetime.strptime("10:00", "%H:%M")
-    end_time = datetime.strptime("17:00", "%H:%M")
+    # 1. Fixed timing setup
+    start_working = datetime.strptime("10:00", "%H:%M")
+    end_working = datetime.strptime("17:00", "%H:%M")
     slot_duration = 30 # minutes
     
-    # 2. DB se check karein kaunse slots booked hain
-    # Maan lijiye aapki appointments table mein 'appointment_date' aur 'appointment_time' hai
+    # 2. DB se booked appointments nikalo
     booked_appointments = db.query(AppointmentModel).filter(
         AppointmentModel.nutritionist_id == id, 
         AppointmentModel.appointment_date == date,
-        AppointmentModel.status != "cancelled" # Sirf wahi jo cancel nahi hue
+        AppointmentModel.status != "cancelled"
     ).all()
     
-#   booked_times = [a.appointment_time.strftime("%H:%M") for a in booked_appointments]
-    booked_times = []
+    # 3. Booked slots ki range nikalo
+    # Hum sirf start_time nahi, end_time tak block karenge
+    blocked_ranges = []
     for a in booked_appointments:
-        t = a.start_time # Aapne model mein start_time use kiya hai
-        if t:
-            booked_times.append(t.strftime("%H:%M") if hasattr(t, 'strftime') else str(t)[:5])
-   
+        if a.start_time and a.end_time:
+            blocked_ranges.append((a.start_time, a.end_time))
+    
     available_slots = []
-    current = start_time
-    while current < end_time:
-        time_str = current.strftime("%H:%M")
+    current = start_working
+    
+    while current < end_working:
+        current_time = current.time()
+        is_booked = False
+        
+        # Check karo ki current slot kisi blocked range ke andar toh nahi hai
+        for b_start, b_end in blocked_ranges:
+            if current_time >= b_start and current_time < b_end:
+                is_booked = True
+                break
+        
         available_slots.append({
-            "time": time_str,
-            "is_available": time_str not in booked_times
+            "time": current_time.strftime("%H:%M"),
+            "is_available": not is_booked
         })
         current += timedelta(minutes=slot_duration)
         
